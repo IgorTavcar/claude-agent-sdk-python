@@ -1231,6 +1231,10 @@ class ClaudeAgentOptions:
     # its remaining token budget so it can pace tool use and wrap up before
     # the limit.
     task_budget: TaskBudget | None = None
+    # Create a new git worktree for this session.
+    # When True, creates a worktree with an auto-generated name.
+    # When a string, creates a worktree with the specified name.
+    worktree: bool | str | None = None
 
 
 # SDK Control Protocol

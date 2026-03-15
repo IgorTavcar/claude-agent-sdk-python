@@ -1462,3 +1462,26 @@ class TestSubprocessCLITransport:
                 assert transport._stderr_stream is None
 
         anyio.run(_test)
+
+    def test_build_command_with_worktree_bool(self):
+        """Test building CLI command with worktree=True."""
+        transport = SubprocessCLITransport(
+            prompt="test",
+            options=make_options(worktree=True),
+        )
+        cmd = transport._build_command()
+        assert "--worktree" in cmd
+        # Should not have a name argument after --worktree
+        wt_idx = cmd.index("--worktree")
+        assert wt_idx + 1 >= len(cmd) or cmd[wt_idx + 1].startswith("--")
+
+    def test_build_command_with_worktree_name(self):
+        """Test building CLI command with worktree as a named string."""
+        transport = SubprocessCLITransport(
+            prompt="test",
+            options=make_options(worktree="my-feature"),
+        )
+        cmd = transport._build_command()
+        assert "--worktree" in cmd
+        wt_idx = cmd.index("--worktree")
+        assert cmd[wt_idx + 1] == "my-feature"
