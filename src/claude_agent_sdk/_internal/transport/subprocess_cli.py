@@ -51,6 +51,7 @@ class SubprocessCLITransport(Transport):
         self._stdin_stream: TextSendStream | None = None
         self._stderr_stream: TextReceiveStream | None = None
         self._stderr_task_group: anyio.abc.TaskGroup | None = None
+        self._stderr_buffer: list[str] = []
         self._ready = False
         self._exit_error: Exception | None = None  # Track process exit errors
         self._max_buffer_size = (
@@ -162,6 +163,44 @@ class SubprocessCLITransport(Transport):
 
         return json.dumps(settings_obj)
 
+    def _apply_skills_defaults(
+        self,
+    ) -> tuple[list[str], list[str] | None]:
+        """Compute effective allowed_tools and setting_sources for skills.
+
+        When ``options.skills`` is ``"all"``, injects the bare ``Skill`` tool;
+        when it is a list, injects ``Skill(name)`` for each entry. In either
+        case ``setting_sources`` defaults to ``["user", "project"]`` when
+        unset so the CLI discovers installed skills without the caller having
+        to wire up both options manually. ``None`` is a no-op.
+
+        Does not mutate the original options object.
+        """
+        allowed_tools: list[str] = list(self._options.allowed_tools)
+        setting_sources: list[str] | None = (
+            list(self._options.setting_sources)
+            if self._options.setting_sources is not None
+            else None
+        )
+
+        skills = self._options.skills
+        if skills is None:
+            return allowed_tools, setting_sources
+
+        if skills == "all":
+            if "Skill" not in allowed_tools:
+                allowed_tools.append("Skill")
+        else:
+            for name in skills:
+                pattern = f"Skill({name})"
+                if pattern not in allowed_tools:
+                    allowed_tools.append(pattern)
+
+        if setting_sources is None:
+            setting_sources = ["user", "project"]
+
+        return allowed_tools, setting_sources
+
     def _build_command(self) -> list[str]:
         """Build CLI command with arguments."""
         if self._cli_path is None:
@@ -193,8 +232,12 @@ class SubprocessCLITransport(Transport):
                 # Preset object - 'claude_code' preset maps to 'default'
                 cmd.extend(["--tools", "default"])
 
-        if self._options.allowed_tools:
-            cmd.extend(["--allowedTools", ",".join(self._options.allowed_tools)])
+        effective_allowed_tools, effective_setting_sources = (
+            self._apply_skills_defaults()
+        )
+
+        if effective_allowed_tools:
+            cmd.extend(["--allowedTools", ",".join(effective_allowed_tools)])
 
         if self._options.max_turns:
             cmd.extend(["--max-turns", str(self._options.max_turns)])
@@ -214,8 +257,11 @@ class SubprocessCLITransport(Transport):
         if self._options.fallback_model:
             cmd.extend(["--fallback-model", self._options.fallback_model])
 
-        if self._options.betas:
-            cmd.extend(["--betas", ",".join(self._options.betas)])
+        if self._options.betas is not None:
+            if len(self._options.betas) == 0:
+                cmd.extend(["--betas", ""])
+            else:
+                cmd.extend(["--betas", ",".join(self._options.betas)])
 
         if self._options.permission_prompt_tool_name:
             cmd.extend(
@@ -280,11 +326,14 @@ class SubprocessCLITransport(Transport):
         # Agents are always sent via initialize request (matching TypeScript SDK)
         # No --agents CLI flag needed
 
-        if self._options.setting_sources:
-            cmd.extend(["--setting-sources", ",".join(self._options.setting_sources)])
+        if effective_setting_sources is not None:
+            if len(effective_setting_sources) == 0:
+                cmd.extend(["--setting-sources", ""])
+            else:
+                cmd.extend(["--setting-sources", ",".join(effective_setting_sources)])
 
         # Add plugin directories
-        if self._options.plugins:
+        if self._options.plugins is not None:
             for plugin in self._options.plugins:
                 if plugin["type"] == "local":
                     cmd.extend(["--plugin-dir", plugin["path"]])
@@ -368,14 +417,9 @@ class SubprocessCLITransport(Transport):
             if self._cwd:
                 process_env["PWD"] = self._cwd
 
-            # Pipe stderr if we have a callback OR debug mode is enabled
-            should_pipe_stderr = (
-                self._options.stderr is not None
-                or "debug-to-stderr" in self._options.extra_args
-            )
-
-            # For backward compat: use debug_stderr file object if no callback and debug is on
-            stderr_dest = PIPE if should_pipe_stderr else None
+            # Always pipe stderr so we can capture it for error reporting.
+            # User callbacks and debug mode are still honored in _handle_stderr().
+            stderr_dest = PIPE
 
             self._process = await anyio.open_process(
                 cmd,
@@ -390,8 +434,8 @@ class SubprocessCLITransport(Transport):
             if self._process.stdout:
                 self._stdout_stream = TextReceiveStream(self._process.stdout)
 
-            # Setup stderr stream if piped
-            if should_pipe_stderr and self._process.stderr:
+            # Setup stderr stream (always piped for error capture)
+            if self._process.stderr:
                 self._stderr_stream = TextReceiveStream(self._process.stderr)
                 # Start async task to read stderr
                 self._stderr_task_group = anyio.create_task_group()
@@ -421,7 +465,7 @@ class SubprocessCLITransport(Transport):
             raise error from e
 
     async def _handle_stderr(self) -> None:
-        """Handle stderr stream - read and invoke callbacks."""
+        """Handle stderr stream - read, buffer, and invoke callbacks."""
         if not self._stderr_stream:
             return
 
@@ -430,6 +474,9 @@ class SubprocessCLITransport(Transport):
                 line_str = line.rstrip()
                 if not line_str:
                     continue
+
+                # Always capture stderr for error reporting
+                self._stderr_buffer.append(line_str)
 
                 # Call the stderr callback if provided
                 if self._options.stderr:
@@ -500,6 +547,7 @@ class SubprocessCLITransport(Transport):
         self._stdout_stream = None
         self._stdin_stream = None
         self._stderr_stream = None
+        self._stderr_buffer = []
         self._exit_error = None
 
     async def write(self, data: str) -> None:
@@ -610,10 +658,13 @@ class SubprocessCLITransport(Transport):
 
         # Use exit code for error detection
         if returncode is not None and returncode != 0:
+            captured_stderr = (
+                "\n".join(self._stderr_buffer) if self._stderr_buffer else None
+            )
             self._exit_error = ProcessError(
                 f"Command failed with exit code {returncode}",
                 exit_code=returncode,
-                stderr="Check stderr output for details",
+                stderr=captured_stderr,
             )
             raise self._exit_error
 

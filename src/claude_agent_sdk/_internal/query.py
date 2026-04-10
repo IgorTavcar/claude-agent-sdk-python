@@ -6,7 +6,7 @@ import logging
 import os
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import anyio
 from mcp.types import (
@@ -15,6 +15,7 @@ from mcp.types import (
     ListToolsRequest,
 )
 
+from .._errors import ProcessError
 from ..types import (
     PermissionMode,
     PermissionResultAllow,
@@ -77,6 +78,7 @@ class Query:
         initialize_timeout: float = 60.0,
         agents: dict[str, dict[str, Any]] | None = None,
         exclude_dynamic_sections: bool | None = None,
+        skills: list[str] | Literal["all"] | None = None,
     ):
         """Initialize Query with transport and callbacks.
 
@@ -90,6 +92,8 @@ class Query:
             agents: Optional agent definitions to send via initialize
             exclude_dynamic_sections: Optional preset-prompt flag to send via
                 initialize (see ``SystemPromptPreset``)
+            skills: Optional skill allowlist to send via initialize so the CLI
+                can filter which skills are loaded into the system prompt
         """
         self._initialize_timeout = initialize_timeout
         self.transport = transport
@@ -99,6 +103,7 @@ class Query:
         self.sdk_mcp_servers = sdk_mcp_servers or {}
         self._agents = agents
         self._exclude_dynamic_sections = exclude_dynamic_sections
+        self._skills = skills
 
         # Control protocol state
         self.pending_control_responses: dict[str, anyio.Event] = {}
@@ -160,6 +165,10 @@ class Query:
             request["agents"] = self._agents
         if self._exclude_dynamic_sections is not None:
             request["excludeDynamicSections"] = self._exclude_dynamic_sections
+        # 'all' and omitted are equivalent at the wire level (no filter), so
+        # only send the field when it's an explicit list.
+        if isinstance(self._skills, list):
+            request["skills"] = self._skills
 
         # Use longer timeout for initialize since MCP servers may take time to start
         response = await self._send_control_request(
@@ -245,6 +254,21 @@ class Query:
             # Task was cancelled - this is expected behavior
             logger.debug("Read task cancelled")
             raise  # Re-raise to properly handle cancellation
+        except ProcessError as e:
+            # The CLI can exit non-zero after delivering a valid result (e.g.,
+            # StructuredOutput tool_use triggers exit code 1). When we already
+            # received a result message, treat the process error as non-fatal.
+            if self._first_result_event.is_set():
+                logger.warning(
+                    f"Process exited with code {e.exit_code} after result — ignoring"
+                )
+            else:
+                logger.error(f"Process error before result: {e}")
+                for request_id, event in list(self.pending_control_responses.items()):
+                    if request_id not in self.pending_control_results:
+                        self.pending_control_results[request_id] = e
+                        event.set()
+                await self._message_send.send({"type": "error", "error": str(e)})
         except Exception as e:
             logger.error(f"Fatal error in message reader: {e}")
             # Signal all pending control requests so they fail fast instead of timing out

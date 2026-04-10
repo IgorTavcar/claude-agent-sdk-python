@@ -221,6 +221,7 @@ HookEvent = (
     | Literal["Stop"]
     | Literal["SubagentStop"]
     | Literal["PreCompact"]
+    | Literal["PostCompact"]
     | Literal["Notification"]
     | Literal["SubagentStart"]
     | Literal["PermissionRequest"]
@@ -324,6 +325,14 @@ class PreCompactHookInput(BaseHookInput):
     custom_instructions: str | None
 
 
+class PostCompactHookInput(BaseHookInput):
+    """Input data for PostCompact hook events."""
+
+    hook_event_name: Literal["PostCompact"]
+    trigger: Literal["manual", "auto"]
+    compact_summary: str
+
+
 class NotificationHookInput(BaseHookInput):
     """Input data for Notification hook events."""
 
@@ -359,6 +368,7 @@ HookInput = (
     | StopHookInput
     | SubagentStopHookInput
     | PreCompactHookInput
+    | PostCompactHookInput
     | NotificationHookInput
     | SubagentStartHookInput
     | PermissionRequestHookInput
@@ -405,6 +415,13 @@ class SessionStartHookSpecificOutput(TypedDict):
     additionalContext: NotRequired[str]
 
 
+class PostCompactHookSpecificOutput(TypedDict):
+    """Hook-specific output for PostCompact events."""
+
+    hookEventName: Literal["PostCompact"]
+    additionalContext: NotRequired[str]
+
+
 class NotificationHookSpecificOutput(TypedDict):
     """Hook-specific output for Notification events."""
 
@@ -432,6 +449,7 @@ HookSpecificOutput = (
     | PostToolUseFailureHookSpecificOutput
     | UserPromptSubmitHookSpecificOutput
     | SessionStartHookSpecificOutput
+    | PostCompactHookSpecificOutput
     | NotificationHookSpecificOutput
     | SubagentStartHookSpecificOutput
     | PermissionRequestHookSpecificOutput
@@ -1222,6 +1240,16 @@ class ClaudeAgentOptions:
     agents: dict[str, AgentDefinition] | None = None
     # Setting sources to load (user, project, local)
     setting_sources: list[SettingSource] | None = None
+    # Skills to enable for the main session. This is the one place to turn
+    # skills on; you do not need to add ``"Skill"`` to ``allowed_tools`` or
+    # set ``setting_sources`` yourself — the SDK does both when this is set.
+    # The value is also sent on the ``initialize`` control request so a
+    # supporting CLI can filter which skills are loaded into the system prompt
+    # (older CLIs ignore the field).
+    #   * ``None`` (default): skills are off.
+    #   * ``"all"``: enable every discovered skill.
+    #   * ``[name, ...]``: enable only the listed skills.
+    skills: list[str] | Literal["all"] | None = None
     # Sandbox configuration for bash command isolation.
     # Filesystem and network restrictions are derived from permission rules (Read/Edit/WebFetch),
     # not from these sandbox settings.
