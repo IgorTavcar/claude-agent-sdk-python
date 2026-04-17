@@ -502,7 +502,7 @@ class TestDeleteSession:
         sid, file_path = _make_session_file(project_dir)
         subagent_dir = project_dir / sid
         subagent_dir.mkdir()
-        (subagent_dir / "sub.jsonl").write_text("{}\n")
+        (subagent_dir / f"{uuid.uuid4()}.jsonl").write_text("{}\n")
 
         delete_session(sid, directory=project_path)
 
